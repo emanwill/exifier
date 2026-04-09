@@ -1,203 +1,109 @@
-import { opendir, mkdir, rename, readFile } from "node:fs/promises";
-import { join, extname, resolve } from "node:path";
-import ExifReader from "exifreader";
+import { exiftool } from "exiftool-vendored";
+import pLimit from "p-limit";
+import { readdir } from "node:fs/promises";
+import { join, relative, basename, parse as parsePath } from "node:path";
+import { parseArgs } from "node:util";
 
-// ── Configuration ────────────────────────────────────────────────────────────
+/** Regex matching file extensions to process (currently all JPEG and MP4 files). */
+const FILE_PATTERN = /\.(jpe?g|mp4)$/i;
 
-/** Regex that filenames must match to be processed. */
-const FILENAME_PATTERN = /\.(jpe?g|tiff?|png|heic|webp|avif)$/i;
+/** Max number of files read/written concurrently via exiftool. */
+const CONCURRENCY = 8;
 
-/** Max files processed concurrently (keeps file-handle usage bounded). */
-const CONCURRENCY = 20;
+// --- CLI ---
 
-// ── CLI ──────────────────────────────────────────────────────────────────────
+const { values: opts, positionals } = parseArgs({
+  options: {
+    "no-backup": { type: "boolean", default: false },
+  },
+  allowPositionals: true,
+});
 
-const args = process.argv.slice(2);
-const dryRun = args.includes("--dry-run");
-const filteredArgs = args.filter((a) => a !== "--dry-run");
-
-const [sourceDir, targetDir] = filteredArgs;
-
-if (!sourceDir || !targetDir) {
-  console.error("Usage: node index.mjs [--dry-run] <sourceDir> <targetDir>");
+const rootDir = positionals[0];
+if (!rootDir) {
+  console.error("Usage: node index.mjs [--no-backup] <rootDir>");
   process.exit(1);
 }
 
-const srcRoot = resolve(sourceDir);
-const dstRoot = resolve(targetDir);
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// --- Rule engine (placeholder) ---
 
 /**
- * Recursively yields every file path under `dir`.
- * @param {string} dir directory
+ * Pure function: given a file's relative path, filename, and existing exif tags,
+ * return the new tags to write, or null if no changes are needed.
+ *
+ * @param {string} relPath - path of the file relative to rootDir (e.g. "vacation/beach/IMG_001.jpg")
+ * @param {string} filename - the file's basename including extension (e.g. "IMG_001.jpg")
+ * @param {import("exiftool-vendored").Tags} existingTags - all existing EXIF/IPTC/XMP tags as read by exiftool
+ * @returns {import("exiftool-vendored").WriteTags | null} tags to write, or null to skip this file
  */
-async function* walk(dir) {
-  const d = await opendir(dir);
-  for await (const entry of d) {
+function computeNewTags(relPath, filename, existingTags) {
+  // Placeholder rule: add the filename (minus extension) as a keyword,
+  // unless the filename starts with a number.
+  if (/^\d/.test(filename)) return null;
+
+  const stem = parsePath(filename).name;
+  return { Keywords: stem };
+}
+
+// --- File discovery ---
+
+async function* walkFiles(dir) {
+  const entries = await readdir(dir, { withFileTypes: true });
+  for (const entry of entries) {
     const full = join(dir, entry.name);
     if (entry.isDirectory()) {
-      yield* walk(full);
-    } else if (entry.isFile()) {
-      yield { name: entry.name, path: full };
+      yield* walkFiles(full);
+    } else if (FILE_PATTERN.test(entry.name)) {
+      yield full;
     }
   }
 }
 
-/**
- * Read all EXIF tags from an image file.
- * Returns the full tag map (each value has `.value` and `.description`).
- */
-async function readExif(filePath) {
-  const buf = await readFile(filePath);
-  return ExifReader.load(buf, { expanded: true });
+// --- Processing ---
+
+async function processFile(filePath, rootDir, writeArgs) {
+  const filename = basename(filePath);
+  const relPath = relative(rootDir, filePath);
+
+  const existingTags = await exiftool.read(filePath);
+  const newTags = computeNewTags(relPath, filename, existingTags);
+
+  if (newTags == null) return { filePath, status: "skipped" };
+
+  await exiftool.write(filePath, newTags, { writeArgs });
+  return { filePath, status: "written" };
 }
-
-/**
- * Build a target filename from EXIF data.
- *
- * Currently uses the date the photo was taken, formatted as
- * `YYYY-MM-DD_HHmmss`.  The full `exif` object is available here so
- * the template can be changed to use any other field.
- * 
- * @param {ExifReader.ExpandedTags} exifTags exif tags object
- * @param {string} ext file extension (e.g. ".jpeg")
- * @returns {string | null} new filename, or `null` if filename cannot be constructed
- */
-function buildName(exifTags, ext) {
-  const dateTag =
-    exifTags?.exif?.DateTimeOriginal ??
-    exifTags?.exif?.DateTimeDigitized ??
-    exifTags?.exif?.DateTime;
-
-  if (!dateTag) return null;
-
-  // DateTimeOriginal is typically "YYYY:MM:DD HH:MM:SS"
-  const raw = dateTag.description ?? String(dateTag.value);
-  const match = raw.match(
-    /(\d{4})[:\-/](\d{2})[:\-/](\d{2})\s+(\d{2}):(\d{2}):(\d{2})/
-  );
-  if (!match) return null;
-
-  const [, y, mo, d, h, mi, s] = match;
-  return `${y}-${mo}-${d}_${h}${mi}${s}${ext}`;
-}
-
-/**
- * Simple concurrency limiter.
- */
-function makeSemaphore(max) {
-  let active = 0;
-  const queue = [];
-
-  function next() {
-    if (queue.length > 0 && active < max) {
-      active++;
-      const resolve = queue.shift();
-      resolve();
-    }
-  }
-
-  return {
-    acquire() {
-      return new Promise((res) => {
-        queue.push(res);
-        next();
-      });
-    },
-    release() {
-      active--;
-      next();
-    },
-  };
-}
-
-/**
- * Ensure `name` is unique inside the set of already-claimed names.
- * Appends _001, _002, … on collision.
- */
-function dedup(name, claimed) {
-  if (!claimed.has(name)) {
-    claimed.add(name);
-    return name;
-  }
-  const dot = name.lastIndexOf(".");
-  const base = dot === -1 ? name : name.slice(0, dot);
-  const ext = dot === -1 ? "" : name.slice(dot);
-  let i = 1;
-  while (true) {
-    const candidate = `${base}_${String(i).padStart(3, "0")}${ext}`;
-    if (!claimed.has(candidate)) {
-      claimed.add(candidate);
-      return candidate;
-    }
-    i++;
-  }
-}
-
-// ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  if (!dryRun) {
-    await mkdir(dstRoot, { recursive: true });
-  }
-
-  const sem = makeSemaphore(CONCURRENCY);
-  const claimed = new Set(); // target filenames already used
+  const writeArgs = opts["no-backup"] ? ["-overwrite_original"] : [];
+  const limit = pLimit(CONCURRENCY);
   const tasks = [];
 
-  let found = 0;
-  let processed = 0;
+  let total = 0;
+  let written = 0;
   let skipped = 0;
+  let failed = 0;
 
-  for await (const file of walk(srcRoot)) {
-    if (!FILENAME_PATTERN.test(file.name)) continue;
-    found++;
-
-    await sem.acquire();
-
-    const task = (async () => {
-      try {
-        const exif = await readExif(file.path);
-        const ext = extname(file.name).toLowerCase();
-        const newName = buildName(exif, ext);
-
-        if (!newName) {
-          console.warn(`  SKIP (missing required EXIF): ${file.path}`);
-          skipped++;
-          return;
+  for await (const filePath of walkFiles(rootDir)) {
+    total++;
+    tasks.push(
+      limit(async () => {
+        try {
+          const result = await processFile(filePath, rootDir, writeArgs);
+          if (result.status === "written") written++;
+          else skipped++;
+        } catch (err) {
+          failed++;
+          console.error(`Error processing ${filePath}: ${err.message}`);
         }
-
-        const uniqueName = dedup(newName, claimed);
-        const dst = join(dstRoot, uniqueName);
-
-        if (dryRun) {
-          console.log(`  [dry-run] ${file.path} → ${dst}`);
-        } else {
-          await rename(file.path, dst);
-          console.log(`  ${file.path} → ${dst}`);
-        }
-        processed++;
-      } catch (err) {
-        console.warn(`  SKIP (error): ${file.path} — ${err.message}`);
-        skipped++;
-      } finally {
-        sem.release();
-      }
-    })();
-
-    tasks.push(task);
+      })
+    );
   }
 
   await Promise.all(tasks);
 
-  console.log(
-    `\nDone. Found: ${found}  Processed: ${processed}  Skipped: ${skipped}` +
-      (dryRun ? "  (dry-run, no files moved)" : "")
-  );
+  console.log(`Done. ${total} files found: ${written} written, ${skipped} skipped, ${failed} failed.`);
+  await exiftool.end();
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main();

@@ -18,6 +18,7 @@
   "homepage": "https://github.com/emanwill/exifier#readme",
   "description": "",
   "dependencies": {
-    "exifreader": "^4.38.0"
+    "exiftool-vendored": "^35.15.1",
+    "p-limit": "^7.3.0"
   }
 }
